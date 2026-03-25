@@ -1,12 +1,12 @@
-from pydantic_settings import BaseSettings
-from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
 
 class Settings(BaseSettings):
-    tg_token: str        = Field(..., env='TG_TOKEN')
-    mongo_dsn: str       = Field(..., env='MONGO_DSN')
-    log_level: str       = Field('INFO', env='LOG_LEVEL')
+    model_config = SettingsConfigDict(env_file=".env")
 
-    class Config:
-        env_file = '.env'
+    tg_token: str
+    mongo_dsn: str
+    log_level: str = "INFO"
+
 
 settings = Settings()

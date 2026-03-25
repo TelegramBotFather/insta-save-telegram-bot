@@ -4,42 +4,44 @@ Append-only statistics DAO.
 
 from __future__ import annotations
 
-from datetime import datetime, date
+import logging
+from datetime import date, datetime, timezone
 from typing import Any, Dict
 
 from motor.motor_asyncio import AsyncIOMotorCollection
 from pydantic import BaseModel, Field
 
-from .settings_dao import _get_client        
-import logging
+from .settings_dao import _get_client
 
 log = logging.getLogger(__name__)
 
-
+_stats_index_created = False
 
 
 def _get_collection() -> AsyncIOMotorCollection:
     """Lazy access to the stats collection."""
-    coll = _get_client().get_default_database().stats
-    if not hasattr(coll, "_index_created"):
-        coll.create_index(
+    return _get_client().get_default_database().stats
+
+
+async def _ensure_indexes() -> None:
+    global _stats_index_created
+    if not _stats_index_created:
+        coll = _get_collection()
+        await coll.create_index(
             [("user_id", 1), ("date", 1), ("target_username", 1)]
         )
-        coll.create_index("ts")
-        setattr(coll, "_index_created", True)
+        await coll.create_index("ts")
+        _stats_index_created = True
         log.debug("stats indexes created")
-    return coll
-
 
 
 class StatsRecord(BaseModel):
     user_id: int
     target_username: str
     date: str = Field(default_factory=lambda: date.today().isoformat())
-    ts: datetime = Field(default_factory=datetime.utcnow)
+    ts: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     fetched: int = 1
     sent: int = 0
-
 
 
 class StatsDAO:
@@ -47,6 +49,7 @@ class StatsDAO:
 
     @classmethod
     async def add(cls, user_id: int, username: str, sent: int) -> None:
+        await _ensure_indexes()
         rec: Dict[str, Any] = StatsRecord(
             user_id=user_id,
             target_username=username.lower(),

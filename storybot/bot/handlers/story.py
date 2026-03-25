@@ -22,8 +22,7 @@ from aiogram.types import Message
 
 from ..config import settings
 from ..dao.settings_dao import SettingsDAO
-from ..dao.stats_dao import StatsDAO
-
+from ..keyboards import interval_keyboard
 from ..services.api_client import APIClient
 from ..services.auth_token import AuthTokenManager
 from ..services.browser import BrowserManager
@@ -32,6 +31,21 @@ from ..services.url_decoder import URLDecoder
 log = logging.getLogger(__name__)
 router = Router()
 
+_api_client = APIClient()
+_browser_mgr = BrowserManager()
+
+# Lazily initialised shared Bot for background jobs (auto-check).
+_shared_bot: Bot | None = None
+
+
+def _get_bot() -> Bot:
+    global _shared_bot
+    if _shared_bot is None:
+        _shared_bot = Bot(
+            token=settings.tg_token,
+            default=DefaultBotProperties(parse_mode="HTML"),
+        )
+    return _shared_bot
 
 
 async def fetch_and_push_stories(user_id: int) -> None:
@@ -41,26 +55,13 @@ async def fetch_and_push_stories(user_id: int) -> None:
         log.info("auto-job skipped: user %s has no target_username", user_id)
         return
 
-    bot = Bot(
-        token=settings.tg_token,
-        default=DefaultBotProperties(parse_mode="HTML"),
-    )
+    bot = _get_bot()
     status = await bot.send_message(
         user_id,
         f"🔄 Auto-check @{profile.target_username} …",
     )
 
-    class _PseudoMsg:
-        """Tiny wrapper so we can reuse _process_username logic."""
-        chat = status.chat
-        from_user = status.from_user
-
-        async def answer(_, text: str, **kw):
-            await bot.send_message(user_id, text, **kw)
-
-    await _process_username(_PseudoMsg(), status, profile.target_username)
-
-
+    await _process_username(bot, user_id, status, profile.target_username)
 
 
 @router.message(Command("story"))
@@ -80,19 +81,18 @@ async def handle_username(msg: Message) -> None:
     await SettingsDAO.upsert(profile)
 
     status = await msg.answer(f"🔎 Looking up @{username} …")
-    success = await _process_username(msg, status, username)
+    success = await _process_username(msg.bot, msg.chat.id, status, username)
 
     if success:
-        from .auto import _interval_keyboard 
         await msg.answer(
             "⚙️ Choose an auto-check interval:",
-            reply_markup=_interval_keyboard(),
+            reply_markup=interval_keyboard(),
         )
 
 
-
 async def _process_username(
-    requester: Message | Any,
+    bot: Bot,
+    chat_id: int,
     status: Message,
     username: str,
 ) -> bool:
@@ -101,17 +101,17 @@ async def _process_username(
         auth_token = AuthTokenManager.build_auth_token(username)
 
         await status.edit_text("🌐 Launching headless browser …")
-        await BrowserManager().trigger_browser_async(username)
+        await _browser_mgr.trigger_browser_async(username)
 
         await status.edit_text("⌛ Querying anonstories API …")
-        data = await APIClient().wait_for_stories(auth_token)
+        data = await _api_client.wait_for_stories(auth_token)
         if not data:
             await status.edit_text(
                 "❌ Nothing found (private or non-existent account)."
             )
             return False
 
-        await _send_profile_info(requester, data["user_info"])
+        await _send_profile_info(bot, chat_id, data["user_info"])
 
         stories = data["stories"]
         if not stories:
@@ -120,26 +120,28 @@ async def _process_username(
 
         await status.edit_text(f"📲 Found {len(stories)} stories — sending …")
         for idx, story in enumerate(stories, 1):
-            await _send_single_story(requester, story, idx, len(stories))
+            await _send_single_story(bot, chat_id, story, idx, len(stories))
             if idx < len(stories):
                 await asyncio.sleep(0.4)
+
         await SettingsDAO.add_search(
-			user_id=requester.from_user.id,
-			username=username,
-			sent=len(stories),
-		)
-        
+            user_id=chat_id,
+            username=username,
+            sent=len(stories),
+        )
 
         await status.delete()
         return True
 
-    except Exception as exc:  # noqa: BL
+    except Exception as exc:
         log.exception("Failed to fetch %s: %s", username, exc)
         await status.edit_text("💥 An error occurred while fetching stories.")
         return False
 
 
-async def _send_profile_info(msg: Message | Any, info: Dict[str, Any]) -> None:
+async def _send_profile_info(
+    bot: Bot, chat_id: int, info: Dict[str, Any]
+) -> None:
     avatar = URLDecoder.decode_embed_url(info.get("profile_pic_url", ""))
 
     caption = (
@@ -153,16 +155,17 @@ async def _send_profile_info(msg: Message | Any, info: Dict[str, Any]) -> None:
 
     try:
         if avatar.startswith(("http://", "https://")):
-            await msg.answer_photo(avatar, caption=caption)
+            await bot.send_photo(chat_id, avatar, caption=caption)
         else:
-            await msg.answer(caption)
-    except Exception as exc:  # noqa: BLE001
+            await bot.send_message(chat_id, caption)
+    except Exception as exc:
         log.warning("send_profile_info: %s", exc)
-        await msg.answer(caption)
+        await bot.send_message(chat_id, caption)
 
 
 async def _send_single_story(
-    msg: Message | Any,
+    bot: Bot,
+    chat_id: int,
     story: Dict[str, Any],
     idx: int,
     total: int,
@@ -172,10 +175,10 @@ async def _send_single_story(
 
     try:
         if story["media_type"] == "image":
-            await msg.answer_photo(src, caption=caption)
+            await bot.send_photo(chat_id, src, caption=caption)
         else:
-            await msg.answer_video(src, caption=caption)
-    except Exception as exc:  # noqa: BLE001
+            await bot.send_video(chat_id, src, caption=caption)
+    except Exception as exc:
         log.warning("Story %s/%s failed: %s", idx, total, exc)
 
 
