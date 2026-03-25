@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from contextlib import asynccontextmanager
 from typing import Any, Dict, Optional
 
 import aiohttp
@@ -24,39 +23,44 @@ MAX_RETRIES = 10          # max polling attempts
 class APIClient:
     """Lightweight async client for anonstories.com."""
 
+    _HEADERS = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"
+            " AppleWebKit/537.36 (KHTML, like Gecko)"
+        ),
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "application/json",
+    }
+
     def __init__(self, timeout: int = API_TIMEOUT) -> None:
         self._timeout = aiohttp.ClientTimeout(total=timeout)
+        self._session: aiohttp.ClientSession | None = None
 
+    async def _get_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(
+                headers=self._HEADERS,
+                timeout=self._timeout,
+            )
+        return self._session
 
-    @asynccontextmanager
-    async def _session(self):
-        async with aiohttp.ClientSession(
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"
-                    " AppleWebKit/537.36 (KHTML, like Gecko)"
-                ),
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Accept": "application/json",
-            },
-            timeout=self._timeout,
-        ) as sess:
-            yield sess
-
+    async def close(self) -> None:
+        if self._session and not self._session.closed:
+            await self._session.close()
 
     async def fetch_story_data(self, auth_token: str) -> Dict[str, Any]:
         """Single POST request, returns raw JSON or empty dict on failure."""
         try:
-            async with self._session() as sess:
-                async with sess.post(API_ENDPOINT, data={"auth": auth_token}) as r:
-                    if r.status != 200:
-                        log.warning("anonstories HTTP %s", r.status)
-                        return {}
-                    return await r.json()
+            sess = await self._get_session()
+            async with sess.post(API_ENDPOINT, data={"auth": auth_token}) as r:
+                if r.status != 200:
+                    log.warning("anonstories HTTP %s", r.status)
+                    return {}
+                return await r.json()
         except asyncio.TimeoutError:
             log.warning("anonstories request timed-out")
             return {}
-        except Exception as exc:  
+        except Exception as exc:
             log.exception("anonstories error: %s", exc)
             return {}
 
